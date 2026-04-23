@@ -1,181 +1,278 @@
 #!/usr/bin/env python3
 """
-Telegram command bot for the crypto scanners.
-Runs every minute via GitHub Actions, polls Telegram for new messages,
-handles commands, and triggers scanner workflows via the GitHub API.
+Crypto Explosion Scanner — GitHub Actions edition
+===================================================
+Scans top coins on CoinGecko every hour and alerts via Telegram when:
+  - 24h price change >= PRICE_CHANGE_MIN  (default +10%)
+  - Current 24h volume >= VOLUME_MULTIPLIER × volume from ~24h ago (default 2x)
 
-Commands:
-    /scan     - trigger the main scanner (24h volume doubled + price +10%)
-    /midcap   - trigger the mid-cap scanner (20M-100M mcap + 1h +10%)
-    /status   - show the last few main scanner runs
-    /help     - list commands
+Uses state.json (committed back to the repo by the workflow) as its
+"database" for volume history and notification cooldown.
+
+Sends a Telegram "scan done" confirmation at the end of every run,
+so you always know it ran (even when zero matches).
 """
 
 import json
 import os
 import sys
+import time
 import requests
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-# ====== CONFIG ======
+# ==================== CONFIG ====================
+COINGECKO_API         = "https://api.coingecko.com/api/v3"
+TOP_N_COINS           = 500
+PRICE_CHANGE_MIN      = 10.0
+VOLUME_MULTIPLIER     = 2.0
+MIN_VOLUME_USD        = 1_000_000
+MAX_MARKET_CAP        = None
+NOTIFY_COOLDOWN_HOURS = 12
+HISTORY_RETENTION_H   = 30
+SNAPSHOT_TARGET_H     = 24
+SNAPSHOT_TOLERANCE_H  = 3
+REQUEST_PAUSE_SEC     = 2.5
+
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")   # only this user can command the bot
-GH_PAT           = os.getenv("GH_PAT", "")
-GH_OWNER         = os.getenv("GH_OWNER", "")           # your github username
-GH_REPO          = os.getenv("GH_REPO", "")            # your repo name
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-GH_WORKFLOW_FILE        = "scanner.yml"                # main scanner workflow
-GH_MIDCAP_WORKFLOW_FILE = "midcap-scanner.yml"         # mid-cap scanner workflow
-
-OFFSET_PATH = Path(__file__).parent / "bot_offset.json"
-
-TG_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
-GH_API  = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}"
-GH_HEADERS = {
-    "Authorization": f"Bearer {GH_PAT}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
+STATE_PATH = Path(__file__).parent / "state.json"
 
 
-# ====== OFFSET (so we don't reprocess old messages) ======
-def load_offset() -> int:
-    if not OFFSET_PATH.exists():
-        return 0
+# ==================== STATE ====================
+def load_state() -> dict:
+    if not STATE_PATH.exists():
+        return {"snapshots": {}, "notified": {}}
     try:
-        return json.load(open(OFFSET_PATH)).get("offset", 0)
-    except Exception:
-        return 0
-
-def save_offset(offset: int) -> None:
-    json.dump({"offset": offset}, open(OFFSET_PATH, "w"))
-
-
-# ====== TELEGRAM ======
-def tg_send(text: str, chat_id: str = None) -> None:
-    try:
-        requests.post(f"{TG_BASE}/sendMessage", json={
-            "chat_id": chat_id or TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": True,
-        }, timeout=15)
+        with open(STATE_PATH) as f:
+            return json.load(f)
     except Exception as e:
-        print(f"tg_send failed: {e}")
+        print(f"Warning: couldn't parse state.json ({e}); starting fresh.")
+        return {"snapshots": {}, "notified": {}}
 
-def tg_get_updates(offset: int):
+
+def save_state(state: dict) -> None:
+    with open(STATE_PATH, "w") as f:
+        json.dump(state, f, separators=(",", ":"))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_iso(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def push_snapshot(state: dict, coin_id: str, volume: float) -> None:
+    snaps = state["snapshots"].setdefault(coin_id, [])
+    snaps.append({"ts": now_iso(), "vol": float(volume)})
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=HISTORY_RETENTION_H)
+    state["snapshots"][coin_id] = [s for s in snaps if parse_iso(s["ts"]) >= cutoff]
+
+
+def volume_around(state: dict, coin_id: str,
+                  hours_ago: float, tolerance_h: float):
+    snaps = state["snapshots"].get(coin_id, [])
+    if not snaps:
+        return None, None
+    now = datetime.now(timezone.utc)
+    target = now - timedelta(hours=hours_ago)
+    lo = now - timedelta(hours=hours_ago + tolerance_h)
+    hi = now - timedelta(hours=max(0, hours_ago - tolerance_h))
+
+    best, best_diff = None, None
+    for s in snaps:
+        t = parse_iso(s["ts"])
+        if not (lo <= t <= hi):
+            continue
+        diff = abs((t - target).total_seconds())
+        if best_diff is None or diff < best_diff:
+            best, best_diff = s, diff
+    if not best:
+        return None, None
+    age_h = (now - parse_iso(best["ts"])).total_seconds() / 3600
+    return best["vol"], age_h
+
+
+def notified_recently(state: dict, coin_id: str) -> bool:
+    ts = state["notified"].get(coin_id)
+    if not ts:
+        return False
+    return (datetime.now(timezone.utc) - parse_iso(ts)).total_seconds() \
+           < NOTIFY_COOLDOWN_HOURS * 3600
+
+
+def mark_notified(state: dict, coin_id: str) -> None:
+    state["notified"][coin_id] = now_iso()
+
+
+def cleanup_notified(state: dict) -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=NOTIFY_COOLDOWN_HOURS * 2)
+    state["notified"] = {
+        k: v for k, v in state["notified"].items()
+        if parse_iso(v) >= cutoff
+    }
+
+
+# ==================== API ====================
+def fetch_top_coins() -> list:
+    all_coins = []
+    per_page = 250
+    pages = (TOP_N_COINS + per_page - 1) // per_page
+    for page in range(1, pages + 1):
+        try:
+            r = requests.get(
+                f"{COINGECKO_API}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": per_page,
+                    "page": page,
+                    "price_change_percentage": "24h",
+                },
+                headers={"User-Agent": "gh-actions-crypto-scanner/1.0"},
+                timeout=30,
+            )
+            if r.status_code == 429:
+                print("Rate limited, sleeping 60s...")
+                time.sleep(60)
+                continue
+            r.raise_for_status()
+            all_coins.extend(r.json())
+            time.sleep(REQUEST_PAUSE_SEC)
+        except Exception as e:
+            print(f"Error fetching page {page}: {e}")
+    return all_coins
+
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("!! Telegram env vars missing; skipping send")
+        return False
     try:
-        r = requests.get(f"{TG_BASE}/getUpdates", params={
-            "offset": offset,
-            "timeout": 0,      # short poll, we run on a schedule
-            "allowed_updates": json.dumps(["message"]),
-        }, timeout=20)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
         r.raise_for_status()
-        return r.json().get("result", [])
+        return True
     except Exception as e:
-        print(f"tg_get_updates failed: {e}")
-        return []
+        print(f"!! Telegram send failed: {e}")
+        return False
 
 
-# ====== GITHUB ======
-def gh_dispatch(workflow_file: str) -> bool:
-    """Trigger any workflow by filename."""
-    url = f"{GH_API}/actions/workflows/{workflow_file}/dispatches"
-    r = requests.post(url, headers=GH_HEADERS,
-                      json={"ref": "main"}, timeout=15)
-    return r.status_code == 204
-
-def gh_recent_runs(limit: int = 5):
-    url = f"{GH_API}/actions/workflows/{GH_WORKFLOW_FILE}/runs"
-    r = requests.get(url, headers=GH_HEADERS,
-                     params={"per_page": limit}, timeout=15)
-    if r.status_code != 200:
-        return []
-    return r.json().get("workflow_runs", [])
+# ==================== FORMATTING ====================
+def fmt_usd(x) -> str:
+    if x is None: return "-"
+    if x >= 1e9:  return f"${x/1e9:.2f}B"
+    if x >= 1e6:  return f"${x/1e6:.2f}M"
+    if x >= 1e3:  return f"${x/1e3:.1f}K"
+    return f"${x:,.2f}"
 
 
-# ====== COMMANDS ======
-def cmd_help(chat_id):
-    tg_send(
-        "*Crypto Scanner Bot*\n"
-        "/scan — run MAIN scanner (vol 2x + price +10% in 24h)\n"
-        "/midcap — run MID-CAP scanner (20M-100M mcap + 1h +10%)\n"
-        "/status — show last 5 main scanner runs\n"
-        "/help — this message",
-        chat_id
+def fmt_price(x) -> str:
+    if x is None: return "-"
+    if x >= 1:    return f"${x:,.4f}"
+    s = f"${x:.8f}"
+    return s.rstrip("0").rstrip(".")
+
+
+def build_alert(h: dict) -> str:
+    return (
+        f"🚀 *{h['name']}*  (`{h['symbol']}`)\n"
+        f"Price: {fmt_price(h['price'])}   *{h['price_chg']:+.1f}%* 24h\n"
+        f"Volume: {fmt_usd(h['volume'])}   *{h['volume_ratio']:.1f}x* vs ~24h ago\n"
+        f"Market Cap: {fmt_usd(h['market_cap'])}   Rank: #{h.get('rank','?')}\n"
+        f"[CoinGecko](https://www.coingecko.com/en/coins/{h['id']}) · "
+        f"[DexScreener](https://dexscreener.com/search?q={h['symbol']}) · "
+        f"[TradingView](https://www.tradingview.com/symbols/{h['symbol']}USDT/)"
     )
 
-def cmd_scan(chat_id):
-    if gh_dispatch(GH_WORKFLOW_FILE):
-        tg_send("🚀 Main scan triggered. Results in ~1 min if anything matches.", chat_id)
-    else:
-        tg_send("❌ Failed to trigger main scan. Check GH_PAT permissions.", chat_id)
 
-def cmd_midcap(chat_id):
-    if gh_dispatch(GH_MIDCAP_WORKFLOW_FILE):
-        tg_send("⚡ Mid-cap scan triggered. Results in ~1 min if anything matches.", chat_id)
-    else:
-        tg_send("❌ Failed to trigger mid-cap scan. Check GH_PAT permissions.", chat_id)
+# ==================== MAIN ====================
+def run_scan():
+    state = load_state()
+    coins = fetch_top_coins()
+    print(f"Fetched {len(coins)} coins")
+    if not coins:
+        return state, []
 
-def cmd_status(chat_id):
-    runs = gh_recent_runs(5)
-    if not runs:
-        tg_send("No runs found (or GH API error).", chat_id)
-        return
-    lines = ["*Recent main scanner runs:*"]
-    for run in runs:
-        emoji = {"success": "✅", "failure": "❌", "in_progress": "⏳",
-                 "queued": "⏸️", "cancelled": "⚪"}.get(
-                 run.get("conclusion") or run.get("status"), "❓")
-        trig = run.get("event", "?")                 # schedule / workflow_dispatch
-        when = run.get("created_at", "").replace("T", " ").replace("Z", "")
-        lines.append(f"{emoji} `{when}` _{trig}_")
-    tg_send("\n".join(lines), chat_id)
+    hits = []
+    for coin in coins:
+        cid = coin.get("id")
+        if not cid:
+            continue
+        current_vol = coin.get("total_volume") or 0
+        price_chg   = coin.get("price_change_percentage_24h") or 0
+        mcap        = coin.get("market_cap") or 0
 
-HANDLERS = {
-    "/scan":   cmd_scan,
-    "/midcap": cmd_midcap,
-    "/status": cmd_status,
-    "/help":   cmd_help,
-    "/start":  cmd_help,
-}
+        push_snapshot(state, cid, current_vol)
 
+        if current_vol < MIN_VOLUME_USD:       continue
+        if price_chg   < PRICE_CHANGE_MIN:     continue
+        if MAX_MARKET_CAP and mcap > MAX_MARKET_CAP: continue
 
-# ====== MAIN ======
-def main():
-    if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GH_PAT, GH_OWNER, GH_REPO]):
-        print("Missing one or more env vars. Check workflow file.")
-        sys.exit(1)
-
-    offset = load_offset()
-    updates = tg_get_updates(offset)
-    if not updates:
-        print("No new messages.")
-        return
-
-    new_offset = offset
-    for upd in updates:
-        new_offset = max(new_offset, upd["update_id"] + 1)
-        msg = upd.get("message") or {}
-        text = (msg.get("text") or "").strip().lower()
-        chat_id = str((msg.get("chat") or {}).get("id", ""))
-
-        # Only respond to the authorised user
-        if chat_id != str(TELEGRAM_CHAT_ID):
-            print(f"Ignoring message from unauthorised chat {chat_id}")
+        old_vol, age = volume_around(state, cid,
+                                     hours_ago=SNAPSHOT_TARGET_H,
+                                     tolerance_h=SNAPSHOT_TOLERANCE_H)
+        if not old_vol or old_vol <= 0:
             continue
 
-        cmd = text.split()[0] if text else ""
-        handler = HANDLERS.get(cmd)
-        if handler:
-            print(f"Handling command: {cmd}")
-            handler(chat_id)
-        elif text.startswith("/"):
-            tg_send(f"Unknown command: `{cmd}`. Try /help", chat_id)
-        # non-command messages are ignored silently
+        ratio = current_vol / old_vol
+        if ratio < VOLUME_MULTIPLIER:
+            continue
 
-    save_offset(new_offset)
-    print(f"Processed {len(updates)} updates, new offset {new_offset}")
+        if notified_recently(state, cid):
+            continue
+
+        hits.append({
+            "id":           cid,
+            "symbol":       coin.get("symbol", "").upper(),
+            "name":         coin.get("name", ""),
+            "price":        coin.get("current_price", 0),
+            "price_chg":    price_chg,
+            "volume":       current_vol,
+            "old_volume":   old_vol,
+            "volume_ratio": ratio,
+            "market_cap":   mcap,
+            "rank":         coin.get("market_cap_rank"),
+            "age_h":        age,
+        })
+        mark_notified(state, cid)
+
+    cleanup_notified(state)
+    return state, hits
+
+
+def main():
+    test_mode = "--test" in sys.argv
+    if test_mode:
+        ok = send_telegram("✅ *Crypto scanner test* — Telegram wiring OK.")
+        print("Telegram test:", "OK" if ok else "FAILED")
+        return
+
+    state, hits = run_scan()
+    print(f"Signals this run: {len(hits)}")
+
+    hits.sort(key=lambda x: x["volume_ratio"], reverse=True)
+    for h in hits[:10]:
+        print(f"  🚀 {h['symbol']:>8}  +{h['price_chg']:5.1f}%  vol x{h['volume_ratio']:.1f}")
+        send_telegram(build_alert(h))
+        time.sleep(1)
+
+    if not hits:
+        send_telegram("_Main scan done — no matches._")
+
+    save_state(state)
+    print("Done.")
 
 
 if __name__ == "__main__":
