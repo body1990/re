@@ -270,6 +270,8 @@ def main():
         time.sleep(1)
 
     save_state(state)
+    if not hits:
+        send_telegram("_Main scan done — no matches._")
     print("Done.")
 
 
