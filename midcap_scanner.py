@@ -226,7 +226,9 @@ def main():
         send_telegram(build_alert(h))
         time.sleep(1)
 
-    save_state(state)
+  save_state(state)
+    if not hits:
+        send_telegram("_Mid-cap scan done — no matches._")
     print("Done.")
 
 
