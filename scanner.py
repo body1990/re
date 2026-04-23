@@ -254,7 +254,6 @@ def run_scan():
 
 
 def main():
-  send_telegram("✅ test ping")
     test_mode = "--test" in sys.argv
     if test_mode:
         ok = send_telegram("✅ *Crypto scanner test* — Telegram wiring OK.")
