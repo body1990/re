@@ -25,7 +25,7 @@ COINGECKO_API          = "https://api.coingecko.com/api/v3"
 TOP_N_COINS            = 1000
 
 MCAP_MIN               = 20_000_000
-MCAP_MAX               = 100_000_000
+MCAP_MAX               = 300_000_000
 VOLUME_MIN             = 10_000_000
 PRICE_CHANGE_1H_MIN    = 10.0
 PRICE_CHANGE_24H_MAX   = 50.0
