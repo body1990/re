@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram command bot for the crypto scanner.
+Telegram command bot for the crypto scanners.
 Runs every minute via GitHub Actions, polls Telegram for new messages,
-handles commands, and triggers the scanner workflow via the GitHub API.
+handles commands, and triggers scanner workflows via the GitHub API.
 
 Commands:
-    /scan     - trigger an immediate scanner run
-    /status   - show the last few runs
+    /scan     - trigger the main scanner (24h volume doubled + price +10%)
+    /midcap   - trigger the mid-cap scanner (20M-100M mcap + 1h +10%)
+    /status   - show the last few main scanner runs
     /help     - list commands
 """
 
@@ -22,7 +23,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")   # only this user can comm
 GH_PAT           = os.getenv("GH_PAT", "")
 GH_OWNER         = os.getenv("GH_OWNER", "")           # your github username
 GH_REPO          = os.getenv("GH_REPO", "")            # your repo name
-GH_WORKFLOW_FILE = "scanner.yml"                       # the workflow to dispatch
+
+GH_WORKFLOW_FILE        = "scanner.yml"                # main scanner workflow
+GH_MIDCAP_WORKFLOW_FILE = "midcap-scanner.yml"         # mid-cap scanner workflow
 
 OFFSET_PATH = Path(__file__).parent / "bot_offset.json"
 
@@ -75,9 +78,9 @@ def tg_get_updates(offset: int):
 
 
 # ====== GITHUB ======
-def gh_dispatch_scan() -> bool:
-    """Trigger the scanner workflow."""
-    url = f"{GH_API}/actions/workflows/{GH_WORKFLOW_FILE}/dispatches"
+def gh_dispatch(workflow_file: str) -> bool:
+    """Trigger any workflow by filename."""
+    url = f"{GH_API}/actions/workflows/{workflow_file}/dispatches"
     r = requests.post(url, headers=GH_HEADERS,
                       json={"ref": "main"}, timeout=15)
     return r.status_code == 204
@@ -95,24 +98,31 @@ def gh_recent_runs(limit: int = 5):
 def cmd_help(chat_id):
     tg_send(
         "*Crypto Scanner Bot*\n"
-        "/scan — run the scanner now\n"
-        "/status — show last 5 scheduled runs\n"
+        "/scan — run MAIN scanner (vol 2x + price +10% in 24h)\n"
+        "/midcap — run MID-CAP scanner (20M-100M mcap + 1h +10%)\n"
+        "/status — show last 5 main scanner runs\n"
         "/help — this message",
         chat_id
     )
 
 def cmd_scan(chat_id):
-    if gh_dispatch_scan():
-        tg_send("🚀 Scan triggered. Results in ~1 minute if any coins match.", chat_id)
+    if gh_dispatch(GH_WORKFLOW_FILE):
+        tg_send("🚀 Main scan triggered. Results in ~1 min if anything matches.", chat_id)
     else:
-        tg_send("❌ Failed to trigger scan. Check GH_PAT permissions.", chat_id)
+        tg_send("❌ Failed to trigger main scan. Check GH_PAT permissions.", chat_id)
+
+def cmd_midcap(chat_id):
+    if gh_dispatch(GH_MIDCAP_WORKFLOW_FILE):
+        tg_send("⚡ Mid-cap scan triggered. Results in ~1 min if anything matches.", chat_id)
+    else:
+        tg_send("❌ Failed to trigger mid-cap scan. Check GH_PAT permissions.", chat_id)
 
 def cmd_status(chat_id):
     runs = gh_recent_runs(5)
     if not runs:
         tg_send("No runs found (or GH API error).", chat_id)
         return
-    lines = ["*Recent scanner runs:*"]
+    lines = ["*Recent main scanner runs:*"]
     for run in runs:
         emoji = {"success": "✅", "failure": "❌", "in_progress": "⏳",
                  "queued": "⏸️", "cancelled": "⚪"}.get(
@@ -124,6 +134,7 @@ def cmd_status(chat_id):
 
 HANDLERS = {
     "/scan":   cmd_scan,
+    "/midcap": cmd_midcap,
     "/status": cmd_status,
     "/help":   cmd_help,
     "/start":  cmd_help,
