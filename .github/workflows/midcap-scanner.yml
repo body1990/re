@@ -1,0 +1,47 @@
+name: Mid-Cap Scanner
+
+on:
+  schedule:
+    # Run hourly, offset by 30 min from main scanner so the two don't
+    # slam CoinGecko at the same time
+    - cron: "30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: midcap-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests
+
+      - name: Run mid-cap scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python midcap_scanner.py
+
+      - name: Commit state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain midcap_state.json)" ]]; then
+            git add midcap_state.json
+            git commit -m "chore: update midcap scanner state [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
