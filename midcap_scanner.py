@@ -6,14 +6,10 @@ Filters for coins that look like early-stage pumps on small/mid-caps:
   - Market cap between MCAP_MIN and MCAP_MAX (default 20M - 100M USD)
   - 24h volume >= VOLUME_MIN (default 10M USD)
   - 1h price change >= PRICE_CHANGE_1H_MIN (default +10%)   ← "fresh" move
-  - 24h price change <= PRICE_CHANGE_24H_MAX (default +50%) ← skip already-pumped
+  - 24h price change <= PRICE_CHANGE_24H_MAX (default +50%) ← skip exhausted
 
-Uses 1h change as a proxy for "last 15 min" — coins passing this filter
-are almost always still mid-move, not already exhausted.
-
-Runs every hour alongside the main scanner. Shares nothing with it
-(independent state file, independent notifications), so you can tune
-each filter separately without cross-contamination.
+Sends a Telegram "scan done" confirmation at the end of every run,
+so you always know it ran (even when zero matches).
 """
 
 import json
@@ -26,14 +22,14 @@ from pathlib import Path
 
 # ==================== CONFIG ====================
 COINGECKO_API          = "https://api.coingecko.com/api/v3"
-TOP_N_COINS            = 1000           # scan deeper — mid-caps are often below top 500
+TOP_N_COINS            = 1000
 
-MCAP_MIN               = 20_000_000     # $20M floor
-MCAP_MAX               = 100_000_000    # $100M ceiling
-VOLUME_MIN             = 10_000_000     # $10M daily volume floor
-PRICE_CHANGE_1H_MIN    = 10.0           # "last hour" move (proxy for 15m)
-PRICE_CHANGE_24H_MAX   = 50.0           # skip already-exhausted pumps
-NOTIFY_COOLDOWN_HOURS  = 6              # shorter cooldown — these move fast
+MCAP_MIN               = 20_000_000
+MCAP_MAX               = 100_000_000
+VOLUME_MIN             = 10_000_000
+PRICE_CHANGE_1H_MIN    = 10.0
+PRICE_CHANGE_24H_MAX   = 50.0
+NOTIFY_COOLDOWN_HOURS  = 6
 REQUEST_PAUSE_SEC      = 2.5
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -89,7 +85,6 @@ def cleanup_notified(state: dict) -> None:
 
 # ==================== API ====================
 def fetch_top_coins() -> list:
-    """Need 1h AND 24h price change, so request both."""
     all_coins = []
     per_page = 250
     pages = (TOP_N_COINS + per_page - 1) // per_page
@@ -189,7 +184,6 @@ def run_scan():
         price_chg_1h  = coin.get("price_change_percentage_1h_in_currency") or 0
         price_chg_24h = coin.get("price_change_percentage_24h_in_currency") or 0
 
-        # The four-filter cascade
         if not (MCAP_MIN <= mcap <= MCAP_MAX):      continue
         if volume       < VOLUME_MIN:               continue
         if price_chg_1h < PRICE_CHANGE_1H_MIN:      continue
@@ -220,15 +214,16 @@ def main():
     print(f"Mid-cap signals this run: {len(hits)}")
 
     hits.sort(key=lambda x: x["price_chg_1h"], reverse=True)
-    for h in hits[:10]:  # cap per-run spam
+    for h in hits[:10]:
         print(f"  ⚡ {h['symbol']:>8}  1h +{h['price_chg_1h']:5.1f}%  "
               f"mcap {fmt_usd(h['market_cap'])}  vol {fmt_usd(h['volume'])}")
         send_telegram(build_alert(h))
         time.sleep(1)
 
-  save_state(state)
     if not hits:
         send_telegram("_Mid-cap scan done — no matches._")
+
+    save_state(state)
     print("Done.")
 
 
