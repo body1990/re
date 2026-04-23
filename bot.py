@@ -268,9 +268,6 @@ def main():
         send_telegram(build_alert(h))
         time.sleep(1)
 
-    if not hits:
-        send_telegram("_Main scan done — no matches._")
-
     save_state(state)
     print("Done.")
 
