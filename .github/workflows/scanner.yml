@@ -1,0 +1,52 @@
+name: Crypto Scanner
+
+on:
+  schedule:
+    # Every hour on the hour. GitHub schedules are UTC and can run up to
+    # ~10-15 minutes late when the platform is busy — fine for this use case.
+    - cron: "0 * * * *"
+  workflow_dispatch:   # lets you trigger manually from the Actions tab
+
+# Needed so the workflow can commit state.json back to the repo
+permissions:
+  contents: write
+
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git add state.json
+            git commit -m "chore: update scanner state [skip ci]"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
