@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Mid-Cap Early Pump Scanner
-===========================
-Scans top 1500 coins and alerts when ALL conditions are met:
-  - Market cap $10M - $400M
-  - Volume 24h >= $5M (absolute floor)
-  - Volume 24h / Market Cap >= 0.5 (dynamic ratio)
+Mid-Cap Early Pump Scanner — Enhanced
+=======================================
+Filters for early-stage pumps on small/mid-caps:
+  - Market cap $20M – $300M
+  - 24h volume >= $10M
   - 1h price change >= +10%
-  - 24h price change <= +50%
+  - 24h price change <= +50% (skip exhausted pumps)
   - Not alerted for same coin in last 6 hours
 
-Volume condition is DYNAMIC via ratio:
-  - $20M mcap coin needs $10M volume (50% of mcap)
-  - $100M mcap coin needs $50M volume (50% of mcap)
-  - $400M mcap coin needs $200M volume (50% of mcap)
-  Much more meaningful than a fixed floor alone.
+Alert includes:
+  - 1h, 4h, 24h, 7d price changes
+  - Volume 24h
+  - Market cap + rank
+  - Contract address + chain
+  - Links: CoinGecko, CoinMarketCap, DexScreener, TradingView
 """
 
 import json
@@ -26,17 +26,13 @@ from pathlib import Path
 
 # ==================== CONFIG ====================
 COINGECKO_API          = "https://api.coingecko.com/api/v3"
-TOP_N_COINS            = 1500
+TOP_N_COINS            = 1000
 
-MCAP_MIN               = 10_000_000    # $10M
-MCAP_MAX               = 400_000_000   # $400M
-
-VOLUME_FLOOR           = 5_000_000     # $5M absolute minimum
-VOLUME_MCAP_RATIO      = 0.01           # volume must be >= 50% of market cap
-
-PRICE_CHANGE_1H_MIN    = 8.0          # 1h price gain %
-PRICE_CHANGE_24H_MAX   = 50.0          # skip exhausted pumps
-
+MCAP_MIN               = 20_000_000
+MCAP_MAX               = 300_000_000
+VOLUME_MIN             = 10_000_000
+PRICE_CHANGE_1H_MIN    = 10.0
+PRICE_CHANGE_24H_MAX   = 50.0
 NOTIFY_COOLDOWN_HOURS  = 6
 REQUEST_PAUSE_SEC      = 2.5
 
@@ -45,23 +41,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 STATE_PATH = Path(__file__).parent / "midcap_state.json"
 
-# DexScreener chain mapping
-DEXSCREENER_CHAINS = {
-    "ethereum":             "ethereum",
-    "binance-smart-chain":  "bsc",
-    "solana":               "solana",
-    "arbitrum-one":         "arbitrum",
-    "base":                 "base",
-    "polygon-pos":          "polygon",
-    "avalanche":            "avalanche",
-    "optimistic-ethereum":  "optimism",
-    "sui":                  "sui",
-    "fantom":               "fantom",
-    "cronos":               "cronos",
-    "tron":                 "tron",
-    "near":                 "near",
-}
-
 
 # ==================== STATE ====================
 def load_state() -> dict:
@@ -69,9 +48,7 @@ def load_state() -> dict:
         return {"notified": {}}
     try:
         with open(STATE_PATH) as f:
-            s = json.load(f)
-        s.setdefault("notified", {})
-        return s
+            return json.load(f)
     except Exception as e:
         print(f"Warning: couldn't parse state ({e}); starting fresh.")
         return {"notified": {}}
@@ -136,7 +113,7 @@ def fetch_top_coins() -> list:
 
 
 def fetch_coin_detail(coin_id: str) -> dict:
-    """Fetch extended info: 4h/7d price change, contract addresses."""
+    """Fetch extended info: 4h/7d price change, contract address."""
     try:
         r = requests.get(
             f"{COINGECKO_API}/coins/{coin_id}",
@@ -203,6 +180,7 @@ def fmt_pct(x) -> str:
     return f"*{sign}{x:.1f}%*"
 
 def fmt_contract(detail: dict) -> str:
+    """Return best contract address with chain label."""
     platforms = detail.get("platforms") or {}
     priority = [
         ("ethereum",            "ETH"),
@@ -214,8 +192,6 @@ def fmt_contract(detail: dict) -> str:
         ("avalanche",           "AVAX"),
         ("optimistic-ethereum", "OP"),
         ("sui",                 "SUI"),
-        ("tron",                "TRX"),
-        ("fantom",              "FTM"),
     ]
     for chain_key, label in priority:
         addr = platforms.get(chain_key, "")
@@ -229,14 +205,6 @@ def fmt_contract(detail: dict) -> str:
             return f"`{short}` ({label})"
     return "N/A"
 
-def get_dexscreener_url(detail: dict, symbol: str) -> str:
-    platforms = detail.get("platforms") or {}
-    for chain_key, dex_chain in DEXSCREENER_CHAINS.items():
-        addr = platforms.get(chain_key, "")
-        if addr:
-            return f"https://dexscreener.com/{dex_chain}/{addr}"
-    return f"https://dexscreener.com/search?q={symbol}"
-
 
 def build_alert(h: dict, detail: dict) -> str:
     md = detail.get("market_data") or {}
@@ -248,16 +216,9 @@ def build_alert(h: dict, detail: dict) -> str:
 
     vol_24h  = (md.get("total_volume") or {}).get("usd") or h["volume"]
     contract = fmt_contract(detail)
-    dex_url  = get_dexscreener_url(detail, h["symbol"])
-    symbol_up = h["symbol"].upper()
 
     name_slug = h["name"].lower().replace(" ", "-")
     cmc_url   = f"https://coinmarketcap.com/currencies/{name_slug}/"
-    mexc_url  = f"https://www.mexc.com/exchange/{symbol_up}_USDT"
-    tv_url    = f"https://www.tradingview.com/chart/?symbol=MEXC%3A{symbol_up}USDT"
-
-    # Volume/MCap ratio for display
-    ratio = h["volume"] / h["market_cap"] if h["market_cap"] > 0 else 0
 
     parts = []
     if p1h  is not None: parts.append(f"1h: {fmt_pct(p1h)}")
@@ -268,21 +229,20 @@ def build_alert(h: dict, detail: dict) -> str:
 
     return (
         f"⚡ *MID-CAP PUMP*\n"
-        f"*{h['name']}* (`{symbol_up}`)\n"
+        f"*{h['name']}* (`{h['symbol']}`)\n"
         f"\n"
         f"💰 Price: {fmt_price(h['price'])}\n"
         f"📈 {changes_line}\n"
         f"\n"
-        f"📊 Volume 24h: {fmt_usd(vol_24h)} _(x{ratio:.1f} mcap)_\n"
+        f"📊 Volume 24h: {fmt_usd(vol_24h)}\n"
         f"🏦 Market Cap: {fmt_usd(h['market_cap'])}   Rank: #{h.get('rank','?')}\n"
         f"\n"
         f"📝 Contract: {contract}\n"
         f"\n"
-        f"[🟢 MEXC]({mexc_url}) · "
         f"[CoinGecko](https://www.coingecko.com/en/coins/{h['id']}) · "
         f"[CMC]({cmc_url}) · "
-        f"[DexScreener]({dex_url}) · "
-        f"[TradingView]({tv_url})"
+        f"[DexScreener](https://dexscreener.com/search?q={h['symbol']}) · "
+        f"[TradingView](https://www.tradingview.com/symbols/{h['symbol']}USDT/)"
     )
 
 
@@ -303,17 +263,11 @@ def run_scan():
         price_chg_1h  = coin.get("price_change_percentage_1h_in_currency") or 0
         price_chg_24h = coin.get("price_change_percentage_24h_in_currency") or 0
 
-        # Market cap range
-        if not (MCAP_MIN <= mcap <= MCAP_MAX):          continue
-        # Absolute volume floor
-        if volume < VOLUME_FLOOR:                        continue
-        # Dynamic volume/mcap ratio
-        if mcap > 0 and volume / mcap < VOLUME_MCAP_RATIO: continue
-        # Price filters
-        if price_chg_1h  < PRICE_CHANGE_1H_MIN:         continue
-        if price_chg_24h > PRICE_CHANGE_24H_MAX:         continue
-        # Cooldown
-        if notified_recently(state, cid):                continue
+        if not (MCAP_MIN <= mcap <= MCAP_MAX):    continue
+        if volume        < VOLUME_MIN:            continue
+        if price_chg_1h  < PRICE_CHANGE_1H_MIN:  continue
+        if price_chg_24h > PRICE_CHANGE_24H_MAX:  continue
+        if notified_recently(state, cid):         continue
 
         candidates.append({
             "id":            cid,
@@ -336,10 +290,8 @@ def main():
     print(f"Mid-cap signals this run: {len(hits)}")
 
     for h in hits[:10]:
-        ratio = h["volume"] / h["market_cap"] if h["market_cap"] > 0 else 0
         print(f"  ⚡ {h['symbol']:>8}  1h +{h['price_chg_1h']:5.1f}%  "
-              f"mcap {fmt_usd(h['market_cap'])}  "
-              f"vol {fmt_usd(h['volume'])} (x{ratio:.1f})")
+              f"mcap {fmt_usd(h['market_cap'])}  vol {fmt_usd(h['volume'])}")
 
         detail = fetch_coin_detail(h["id"])
         time.sleep(2)
