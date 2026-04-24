@@ -34,7 +34,7 @@ MCAP_MAX               = 400_000_000   # $400M
 VOLUME_FLOOR           = 5_000_000     # $5M absolute minimum
 VOLUME_MCAP_RATIO      = 0.3           # volume must be >= 50% of market cap
 
-PRICE_CHANGE_1H_MIN    = 10.0          # 1h price gain %
+PRICE_CHANGE_1H_MIN    = 8.0          # 1h price gain %
 PRICE_CHANGE_24H_MAX   = 50.0          # skip exhausted pumps
 
 NOTIFY_COOLDOWN_HOURS  = 6
