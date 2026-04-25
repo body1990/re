@@ -26,7 +26,7 @@ from pathlib import Path
 UPBIT_API              = "https://api.upbit.com/v1"
 
 PRICE_CHANGE_15M_MIN   = 5.0      # % price change in last 15min
-VOLUME_SURGE_MIN       = 2.0      # current 15m vol must be Nx previous candle
+VOLUME_SURGE_MIN       = 1.3      # current 15m vol must be Nx previous candle
 MIN_VOLUME_KRW         = 500_000_000  # minimum 15min volume in KRW (~$370K) — filters dust
 NOTIFY_COOLDOWN_HOURS  = 2        # don't re-alert same coin within 2 hours
 REQUEST_PAUSE_SEC      = 0.12     # ~8 req/sec — safely under Upbit limit of 10/sec
