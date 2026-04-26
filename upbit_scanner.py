@@ -28,7 +28,7 @@ from pathlib import Path
 UPBIT_API              = "https://api.upbit.com/v1"
 
 PRICE_CHANGE_15M_MIN   = 5.0           # % change in last completed 15min candle
-VOLUME_SURGE_MIN       = 2.0           # vol must be Nx previous completed candle
+VOLUME_SURGE_MIN       = 1.5           # vol must be Nx previous completed candle
 MIN_VOLUME_KRW         = 50_000_000    # 50M KRW minimum (~$37K) — dust filter
 NOTIFY_COOLDOWN_HOURS  = 2
 REQUEST_PAUSE_SEC      = 0.15          # ~6-7 req/sec — safely under Upbit limit
