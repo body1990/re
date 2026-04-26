@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Upbit Korean Pump Scanner
-==========================
+Upbit Korean Pump Scanner — Fixed
+===================================
 Monitors ALL Upbit KRW markets every 15 minutes.
 Alerts via Telegram when Korean retail pump ignition detected:
-  - 15min price change >= +5%
-  - 15min volume >= 2x previous 15min candle (surge)
+  - Last COMPLETED 15min candle price change >= +5% vs previous completed candle
+  - Last COMPLETED 15min candle volume >= 2x the one before it
+  - Last COMPLETED 15min candle volume >= 50M KRW (~$37K minimum)
   - Not alerted for same coin in last 2 hours
 
-Why Upbit? Korean retail FOMO drives some of the fastest pumps in crypto.
-When Upbit KRW volume doubles + price spikes 5%+ in 15min, the move
-typically has another 15-40% remaining. This catches it at ignition.
-
-No API key needed — Upbit public endpoints are free and open.
+FIXES vs previous version:
+  1. Candle comparison: now uses last 2 COMPLETED candles, not current in-progress candle
+     (current candle has partial volume — was causing artificially low vol ratios)
+  2. Removed 24h pre-filter: coins down on the day can still spike 15%+ in 15min
+  3. Lowered MIN_VOLUME_KRW: 50M KRW (~$37K) instead of 500M — was filtering too much
+  4. Fetch count=5 candles for safety margin
 """
 
 import json
@@ -25,30 +27,18 @@ from pathlib import Path
 # ==================== CONFIG ====================
 UPBIT_API              = "https://api.upbit.com/v1"
 
-PRICE_CHANGE_15M_MIN   = 5.0      # % price change in last 15min
-VOLUME_SURGE_MIN       = 1.3      # current 15m vol must be Nx previous candle
-MIN_VOLUME_KRW         = 500_000_000  # minimum 15min volume in KRW (~$370K) — filters dust
-NOTIFY_COOLDOWN_HOURS  = 2        # don't re-alert same coin within 2 hours
-REQUEST_PAUSE_SEC      = 0.12     # ~8 req/sec — safely under Upbit limit of 10/sec
+PRICE_CHANGE_15M_MIN   = 5.0           # % change in last completed 15min candle
+VOLUME_SURGE_MIN       = 2.0           # vol must be Nx previous completed candle
+MIN_VOLUME_KRW         = 50_000_000    # 50M KRW minimum (~$37K) — dust filter
+NOTIFY_COOLDOWN_HOURS  = 2
+REQUEST_PAUSE_SEC      = 0.15          # ~6-7 req/sec — safely under Upbit limit
 
-# KRW to USD approximate rate (used for display only)
-# Updated manually or fetched dynamically below
-KRW_USD_RATE           = 0.00072  # 1 KRW ≈ $0.00072 (update if stale)
+KRW_USD_FALLBACK       = 0.00072       # fallback if exchange rate API fails
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 STATE_PATH = Path(__file__).parent / "upbit_state.json"
-
-# DexScreener chain mapping for links
-DEXSCREENER_CHAINS = {
-    "ethereum":             "ethereum",
-    "binance-smart-chain":  "bsc",
-    "solana":               "solana",
-    "arbitrum-one":         "arbitrum",
-    "base":                 "base",
-    "polygon-pos":          "polygon",
-}
 
 
 # ==================== STATE ====================
@@ -93,7 +83,7 @@ def cleanup_notified(state: dict) -> None:
 
 # ==================== UPBIT API ====================
 def get_krw_usd_rate() -> float:
-    """Fetch live KRW/USD rate from a free public API."""
+    """Fetch live KRW/USD rate."""
     try:
         r = requests.get(
             "https://api.exchangerate-api.com/v4/latest/USD",
@@ -101,57 +91,36 @@ def get_krw_usd_rate() -> float:
         )
         r.raise_for_status()
         krw_per_usd = r.json()["rates"]["KRW"]
-        return 1 / krw_per_usd
-    except Exception:
-        return KRW_USD_RATE  # fallback to config value
+        rate = 1 / krw_per_usd
+        print(f"KRW/USD rate: {rate:.6f} (1 USD = {krw_per_usd:.0f} KRW)")
+        return rate
+    except Exception as e:
+        print(f"Exchange rate fetch failed ({e}), using fallback {KRW_USD_FALLBACK}")
+        return KRW_USD_FALLBACK
 
 def get_all_krw_markets() -> list:
     """Return list of all KRW-quoted market codes on Upbit."""
     try:
-        r = requests.get(f"{UPBIT_API}/market/all",
-                         params={"isDetails": "false"}, timeout=15)
+        r = requests.get(
+            f"{UPBIT_API}/market/all",
+            params={"isDetails": "false"},
+            headers={"Accept": "application/json"},
+            timeout=15
+        )
         r.raise_for_status()
         markets = r.json()
-        return [m["market"] for m in markets if m["market"].startswith("KRW-")]
+        krw = [m["market"] for m in markets if m["market"].startswith("KRW-")]
+        print(f"Found {len(krw)} KRW markets on Upbit")
+        return krw
     except Exception as e:
         print(f"Failed to fetch markets: {e}")
         return []
 
-def get_candles_15m(market: str, count: int = 3) -> list:
-    """
-    Fetch last N completed 15-minute candles for a market.
-    Returns list ordered oldest → newest.
-    Each candle: {open, high, low, trade_price (close), candle_acc_trade_price (volume KRW)}
-    """
-    try:
-        r = requests.get(
-            f"{UPBIT_API}/candles/minutes/15",
-            params={"market": market, "count": count},
-            headers={"Accept": "application/json"},
-            timeout=10,
-        )
-        if r.status_code == 429:
-            print(f"Rate limited on {market}, sleeping 5s")
-            time.sleep(5)
-            return []
-        r.raise_for_status()
-        candles = r.json()
-        # API returns newest first — reverse to get oldest first
-        return list(reversed(candles))
-    except Exception as e:
-        print(f"Candle error {market}: {e}")
-        return []
-
-def get_ticker(markets: list) -> dict:
-    """
-    Fetch current ticker for multiple markets at once.
-    Returns dict: {market_code: ticker_data}
-    Max 100 markets per call.
-    """
+def get_tickers(markets: list) -> dict:
+    """Bulk ticker fetch. Returns {market_code: ticker_dict}."""
     result = {}
-    chunk_size = 100
-    for i in range(0, len(markets), chunk_size):
-        chunk = markets[i:i + chunk_size]
+    for i in range(0, len(markets), 100):
+        chunk = markets[i:i + 100]
         try:
             r = requests.get(
                 f"{UPBIT_API}/ticker",
@@ -166,6 +135,44 @@ def get_ticker(markets: list) -> dict:
         except Exception as e:
             print(f"Ticker error chunk {i}: {e}")
     return result
+
+def get_candles_15m(market: str, count: int = 5) -> list:
+    """
+    Fetch last N 15-minute candles from Upbit.
+
+    IMPORTANT — Upbit API returns candles NEWEST FIRST:
+      response[0] = current IN-PROGRESS candle (partial data — DO NOT USE for comparison)
+      response[1] = last COMPLETED candle
+      response[2] = candle before that (also complete)
+      response[3] = etc.
+
+    We return them OLDEST FIRST after reversing.
+    After reversing with count=5:
+      candles[0] = oldest
+      candles[1] = 2nd oldest
+      candles[2] = 3rd (complete)
+      candles[3] = last COMPLETED candle  ← use as "previous"
+      candles[4] = current IN-PROGRESS   ← DO NOT USE for volume comparison
+
+    Correct comparison: candles[-2] (prev complete) vs candles[-3] (one before)
+    """
+    try:
+        r = requests.get(
+            f"{UPBIT_API}/candles/minutes/15",
+            params={"market": market, "count": count},
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if r.status_code == 429:
+            print(f"Rate limited on {market}, sleeping 5s")
+            time.sleep(5)
+            return []
+        r.raise_for_status()
+        candles = r.json()  # newest first from API
+        return list(reversed(candles))  # now oldest first
+    except Exception as e:
+        print(f"Candle error {market}: {e}")
+        return []
 
 
 # ==================== TELEGRAM ====================
@@ -215,34 +222,31 @@ def fmt_price_krw(x) -> str:
 
 def fmt_price_usd(x_krw, rate) -> str:
     x = x_krw * rate
-    if x >= 1:    return f"${x:,.4f}"
+    if x >= 1:  return f"${x:,.4f}"
     return f"${x:.8f}".rstrip("0").rstrip(".")
 
-def build_alert(symbol: str, ticker: dict, candles: list,
-                price_chg_15m: float, vol_ratio: float,
-                krw_usd: float) -> str:
+def build_alert(symbol: str, ticker: dict, completed_candle: dict,
+                price_chg_15m: float, vol_ratio: float, krw_usd: float) -> str:
+
     current_price_krw = ticker.get("trade_price", 0)
     high_52w_krw      = ticker.get("highest_52_week_price", 0)
     low_52w_krw       = ticker.get("lowest_52_week_price", 0)
-    chg_24h           = ticker.get("signed_change_rate", 0) * 100
+    chg_24h           = (ticker.get("signed_change_rate") or 0) * 100
     vol_24h_krw       = ticker.get("acc_trade_price_24h", 0)
-    vol_15m_krw       = candles[-1].get("candle_acc_trade_price", 0) if candles else 0
+    vol_15m_krw       = completed_candle.get("candle_acc_trade_price", 0)
 
-    # USD equivalents
     price_usd   = fmt_price_usd(current_price_krw, krw_usd)
     vol_15m_usd = fmt_usd(vol_15m_krw * krw_usd)
     vol_24h_usd = fmt_usd(vol_24h_krw * krw_usd)
 
-    # Distance from 52w high (useful context)
     dist_from_high = ((current_price_krw - high_52w_krw) / high_52w_krw * 100) \
                      if high_52w_krw > 0 else 0
 
-    # Links — Upbit direct, MEXC, Binance, TradingView, DexScreener
-    upbit_url = f"https://upbit.com/exchange?code=CRIX.UPBIT.KRW-{symbol}"
-    mexc_url  = f"https://www.mexc.com/exchange/{symbol}_USDT"
+    upbit_url   = f"https://upbit.com/exchange?code=CRIX.UPBIT.KRW-{symbol}"
+    mexc_url    = f"https://www.mexc.com/exchange/{symbol}_USDT"
     binance_url = f"https://www.binance.com/en/trade/{symbol}_USDT"
-    tv_url    = f"https://www.tradingview.com/chart/?symbol=UPBIT%3A{symbol}KRW"
-    dex_url   = f"https://dexscreener.com/search?q={symbol}"
+    tv_url      = f"https://www.tradingview.com/chart/?symbol=UPBIT%3A{symbol}KRW"
+    dex_url     = f"https://dexscreener.com/search?q={symbol}"
 
     sign_15m = "+" if price_chg_15m >= 0 else ""
     sign_24h = "+" if chg_24h >= 0 else ""
@@ -255,7 +259,7 @@ def build_alert(symbol: str, ticker: dict, candles: list,
         f"📈 15m: *{sign_15m}{price_chg_15m:.1f}%*   "
         f"24h: *{sign_24h}{chg_24h:.1f}%*\n"
         f"\n"
-        f"🔥 Vol surge: *{vol_ratio:.1f}x* (15m candle)\n"
+        f"🔥 Vol surge: *{vol_ratio:.1f}x* last candle\n"
         f"📊 Vol 15m: {fmt_krw(vol_15m_krw)} ({vol_15m_usd})\n"
         f"📊 Vol 24h: {fmt_krw(vol_24h_krw)} ({vol_24h_usd})\n"
         f"\n"
@@ -275,92 +279,90 @@ def build_alert(symbol: str, ticker: dict, candles: list,
 def main():
     state   = load_state()
     krw_usd = get_krw_usd_rate()
-    print(f"KRW/USD rate: {krw_usd:.6f}")
 
-    # Step 1: get all KRW markets
     markets = get_all_krw_markets()
-    print(f"Found {len(markets)} KRW markets on Upbit")
     if not markets:
         send_telegram("⚠️ Upbit scanner: failed to fetch market list")
         return
 
-    # Step 2: bulk ticker for quick 24h change pre-filter
     print("Fetching tickers...")
-    tickers = get_ticker(markets)
+    tickers = get_tickers(markets)
+    print(f"Tickers: {len(tickers)}")
 
-    # Step 3: scan each market
     hits = []
+    skipped_cooldown = 0
+
     for market in markets:
         symbol = market.replace("KRW-", "")
 
         if notified_recently(state, symbol):
+            skipped_cooldown += 1
             continue
 
-        ticker = tickers.get(market, {})
-
-        # Quick pre-filter: 24h change must be positive (skip obvious dumps)
-        chg_24h = (ticker.get("signed_change_rate") or 0) * 100
-        if chg_24h < 0:
-            continue
-
-        # Fetch 15min candles
-        candles = get_candles_15m(market, count=3)
+        # Fetch 5 candles (newest first from API, reversed to oldest first)
+        candles = get_candles_15m(market, count=5)
         time.sleep(REQUEST_PAUSE_SEC)
 
-        if len(candles) < 2:
+        # Need at least 4 candles:
+        # candles[0..2] = older complete candles
+        # candles[3]    = last COMPLETE candle  ← "current" for comparison
+        # candles[4]    = in-progress candle    ← ignore for volume
+        if len(candles) < 4:
             continue
 
-        prev_candle = candles[-2]
-        curr_candle = candles[-1]
+        # FIX: use last 2 COMPLETED candles only
+        # candles[-1] = in-progress (skip)
+        # candles[-2] = last completed candle  ← "curr" for our comparison
+        # candles[-3] = candle before that     ← "prev" for our comparison
+        curr_complete = candles[-2]   # last COMPLETED candle
+        prev_complete = candles[-3]   # one before that
 
-        prev_close  = prev_candle.get("trade_price", 0)
-        curr_close  = curr_candle.get("trade_price", 0)
-        prev_vol    = prev_candle.get("candle_acc_trade_price", 0)  # KRW
-        curr_vol    = curr_candle.get("candle_acc_trade_price", 0)  # KRW
+        curr_close = curr_complete.get("trade_price", 0)
+        prev_close = prev_complete.get("trade_price", 0)
+        curr_vol   = curr_complete.get("candle_acc_trade_price", 0)   # KRW
+        prev_vol   = prev_complete.get("candle_acc_trade_price", 0)   # KRW
 
         if prev_close <= 0 or prev_vol <= 0:
             continue
 
-        # Calculate 15min metrics
         price_chg_15m = (curr_close - prev_close) / prev_close * 100
-        vol_ratio     = curr_vol / prev_vol if prev_vol > 0 else 0
+        vol_ratio     = curr_vol / prev_vol
 
         # Apply filters
         if price_chg_15m < PRICE_CHANGE_15M_MIN:  continue
         if vol_ratio      < VOLUME_SURGE_MIN:      continue
         if curr_vol       < MIN_VOLUME_KRW:        continue
 
+        ticker = tickers.get(market, {})
         hits.append({
-            "symbol":        symbol,
-            "market":        market,
-            "ticker":        ticker,
-            "candles":       candles,
-            "price_chg_15m": price_chg_15m,
-            "vol_ratio":     vol_ratio,
-            "curr_vol_krw":  curr_vol,
+            "symbol":          symbol,
+            "ticker":          ticker,
+            "completed_candle":curr_complete,
+            "price_chg_15m":   price_chg_15m,
+            "vol_ratio":       vol_ratio,
+            "curr_vol_krw":    curr_vol,
         })
         print(f"  🇰🇷 {symbol:>10}  15m {price_chg_15m:+.1f}%  "
               f"vol x{vol_ratio:.1f}  {fmt_krw(curr_vol)}")
 
-    # Sort by 15min price change descending
     hits.sort(key=lambda x: x["price_chg_15m"], reverse=True)
-    print(f"Upbit signals: {len(hits)}")
+    print(f"Upbit signals: {len(hits)}  (skipped {skipped_cooldown} on cooldown)")
 
     for h in hits[:10]:
         msg = build_alert(
-            symbol       = h["symbol"],
-            ticker       = h["ticker"],
-            candles      = h["candles"],
-            price_chg_15m= h["price_chg_15m"],
-            vol_ratio    = h["vol_ratio"],
-            krw_usd      = krw_usd,
+            symbol          = h["symbol"],
+            ticker          = h["ticker"],
+            completed_candle= h["completed_candle"],
+            price_chg_15m   = h["price_chg_15m"],
+            vol_ratio        = h["vol_ratio"],
+            krw_usd          = krw_usd,
         )
         send_telegram(msg)
         mark_notified(state, h["symbol"])
         time.sleep(1)
 
     if not hits:
-        send_telegram("_Upbit scan done — no Korean pumps detected._")
+        send_telegram("_Upbit scan done — no Korean pumps._")
 
     cleanup_notified(state)
     save_state(state)
